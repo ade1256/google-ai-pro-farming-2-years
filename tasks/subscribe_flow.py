@@ -44,6 +44,22 @@ PLAY = "https://play.google.com/store/account/subscriptions?hl=en"
 SETTINGS = "https://one.google.com/settings?expand=upgrade&hl=en"
 SETTLE_S = 45
 
+# Tiap kolom paket punya CTA sendiri; yang benar milik kartu Google AI Pro.
+PLAN_CTA_JS = """() => {
+  const heads = [...document.querySelectorAll('*')].filter(e =>
+    e.children.length === 0 && /Google AI Pro/i.test(e.innerText || ''));
+  for (const h of heads) {
+    let n = h;
+    for (let i = 0; i < 10 && n.parentElement; i++) {
+      n = n.parentElement;
+      const btn = [...n.querySelectorAll('button, a, [role=button]')]
+        .find(b => /get started|choose|select|continue|try/i.test((b.innerText || '').trim()));
+      if (btn) { btn.scrollIntoView({block:'center'}); btn.click(); return true; }
+    }
+  }
+  return false;
+}"""
+
 MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
           "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
 DATE_RE = re.compile(r"\b([A-Z][a-z]{2})[a-z]*\s+(\d{1,2}),\s+(\d{4})\b")
@@ -150,6 +166,8 @@ async def open_dialog(page: Page, layer: int) -> str:
             if await click_visible(page, sel):
                 clicked = True
                 break
+        if not clicked and layer == 1:
+            clicked = bool(await page.evaluate(PLAN_CTA_JS))
         if not clicked:
             say("DIALOG", f"tombol aksi tidak ada yang terlihat (percobaan {attempt + 1})")
             continue
@@ -277,54 +295,75 @@ async def ensure_card(page: Page, acc_id: str) -> bool:
         say("KARTU", "tombol Add card tidak ditemukan")
         return False
 
-    for _ in range(25):
-        await asyncio.sleep(1.0)
+    # Tunggu modal benar-benar selesai digambar: jumlah kolom stabil dan tombol
+    # simpan sudah ada. Mengetik di modal setengah jadi membuat angka kartu hilang.
+    frame = None
+    prev = -1
+    ready = False
+    for _ in range(40):
+        await asyncio.sleep(0.5)
         frame = None
         for f in page.frames:
             try:
-                if await f.locator("input:visible").count() >= 3:
-                    frame = f
-                    break
+                n = await f.locator("input:visible").count()
             except Exception:
                 continue
+            if n >= 3:
+                frame = f
+                break
         if frame is None:
             continue
-        say("FRAME", f"form kartu di {frame.url[:70]}")
-        inputs = frame.locator("input:visible")
-        values = [number, exp, cvc]
-        saved = False
-        for attempt in range(2):
-            if attempt:
-                say("KARTU", "form belum tuntas — isi ulang pelan")
-                await asyncio.sleep(2.0)
-                frame = None
-                for f in page.frames:
-                    try:
-                        if await f.locator("input:visible").count() >= 3:
-                            frame = f
-                            break
-                    except Exception:
-                        continue
-                if frame is None:
-                    break
-                inputs = frame.locator("input:visible")
-            await asyncio.sleep(0.4)
+        n = await frame.locator("input:visible").count()
+        if n == prev and await frame.locator('button:has-text("Save card")').count():
+            ready = True
+            break
+        prev = n
+    if not ready or frame is None:
+        say("KARTU", "form kartu tidak siap")
+        return False
+    say("FRAME", f"form kartu di {frame.url[:70]}")
+    await asyncio.sleep(1.0)
 
-            for idx, value in enumerate(values):
-                field = inputs.nth(idx)
-                await field.click()
-                await field.fill("")
-                # Nomor kartu diformat ulang oleh Google sambil diketik, jadi lebih
-                # pelan dan diberi jeda supaya field berikutnya tidak bergeser.
-                await field.press_sequentially(value, delay=70 if idx == 0 else 45)
-                await asyncio.sleep(0.9 if idx == 0 else 0.45)
-            if await inputs.count() >= 5:
+    inputs = frame.locator("input:visible")
+    values = [number, exp, cvc]
+    saved = False
+    for attempt in range(2):
+        if attempt:
+            say("KARTU", "form belum tuntas — isi ulang pelan")
+            await asyncio.sleep(2.0)
+            frame = None
+            for f in page.frames:
                 try:
-                    if not (await inputs.nth(3).input_value()).strip():
-                        await inputs.nth(3).fill("CARD HOLDER")
-                    await inputs.nth(4).fill("97201")
+                    if await f.locator("input:visible").count() >= 3:
+                        frame = f
+                        break
                 except Exception:
-                    pass
+                    continue
+            if frame is None:
+                break
+            inputs = frame.locator("input:visible")
+        await asyncio.sleep(0.4)
+
+        for idx, value in enumerate(values):
+            field = inputs.nth(idx)
+            await field.click()
+            try:
+                if (await field.input_value()).strip():
+                    await field.press("Meta+a")
+                    await field.press("Backspace")
+            except Exception:
+                pass
+            await asyncio.sleep(0.4)
+            # Diketik, bukan fill: Google memformat ulang nomor sambil diketik.
+            await field.press_sequentially(value, delay=80 if idx == 0 else 55)
+            await asyncio.sleep(1.0 if idx == 0 else 0.5)
+        if await inputs.count() >= 5:
+            try:
+                if not (await inputs.nth(3).input_value()).strip():
+                    await inputs.nth(3).press_sequentially("CARD HOLDER", delay=40)
+                await inputs.nth(4).press_sequentially("97201", delay=40)
+            except Exception:
+                pass
             await asyncio.sleep(0.8)
 
             save = 'button:has-text("Save card")'
