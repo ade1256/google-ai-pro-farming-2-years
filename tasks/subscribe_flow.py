@@ -44,6 +44,22 @@ PLAY = "https://play.google.com/store/account/subscriptions?hl=en"
 SETTINGS = "https://one.google.com/settings?expand=upgrade&hl=en"
 SETTLE_S = 45
 
+# Tiap kolom paket punya CTA sendiri; yang benar milik kartu Google AI Pro.
+PLAN_CTA_JS = """() => {
+  const heads = [...document.querySelectorAll('*')].filter(e =>
+    e.children.length === 0 && /Google AI Pro/i.test(e.innerText || ''));
+  for (const h of heads) {
+    let n = h;
+    for (let i = 0; i < 10 && n.parentElement; i++) {
+      n = n.parentElement;
+      const btn = [...n.querySelectorAll('button, a, [role=button]')]
+        .find(b => /get started|choose|select|continue|try/i.test((b.innerText || '').trim()));
+      if (btn) { btn.scrollIntoView({block:'center'}); btn.click(); return true; }
+    }
+  }
+  return false;
+}"""
+
 MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
           "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
 DATE_RE = re.compile(r"\b([A-Z][a-z]{2})[a-z]*\s+(\d{1,2}),\s+(\d{4})\b")
@@ -85,9 +101,15 @@ async def eacq_frames(page: Page) -> list:
 async def frame_text(page: Page) -> str:
     for f in await eacq_frames(page):
         try:
-            return " ".join((await f.inner_text("body", timeout=3000)).split())
+            text = " ".join((await f.inner_text("body", timeout=3000)).split())
         except Exception:
             continue
+        # Frame yang belum ter-render bisa mengembalikan sumber halamannya
+        # sendiri (puluhan ribu karakter) yang kebetulan memuat teks penanda
+        # dialog; teks sebesar itu tidak pernah teks dialog asli.
+        if len(text) > 20000:
+            continue
+        return text
     return ""
 
 
@@ -105,12 +127,6 @@ async def await_dialog(page: Page, seconds: int = 40) -> str:
         await asyncio.sleep(1.0)
         text = await frame_text(page)
         if not text:
-            continue
-        # Local patch: through this VM's relay the unrendered eacquire frame
-        # can report its own inline script source (tens of KB) as body text,
-        # which false-matches the markers below. A rendered dialog is small;
-        # keep waiting instead of accepting raw source.
-        if len(text) > 20000:
             continue
         if any(m in text.lower() for m in DIALOG_MARKERS):
             return text
@@ -133,32 +149,6 @@ async def click_visible(page: Page, selector: str) -> bool:
     return False
 
 
-async def click_pro_discount(page: Page) -> bool:
-    """Local patch: this account's plans page labels the AI Pro CTA
-    "Get discount" (Annual view) instead of "Get started", and the generic
-    "Upgrade" selector only hits the sidebar nav. Click the discount button
-    that belongs to the Google AI Pro card specifically."""
-    js = """() => {
-      // Visible "Get discount" buttons run left->right: Storage, AI Plus,
-      // AI Pro. Ultra has no discount button, so the last visible one is
-      // the AI Pro card's. (Card headings are not ancestors of the button,
-      // so ancestry matching fails; geometry is the reliable key here.)
-      const btns = Array.from(document.querySelectorAll('button, a, [role="button"]'))
-        .filter((e) => {
-          const r = e.getBoundingClientRect();
-          return (e.innerText || '').trim() === 'Get discount' && r.width > 15 && r.height > 15;
-        })
-        .sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
-      if (!btns.length) return false;
-      btns[btns.length - 1].click();
-      return true;
-    }"""
-    try:
-        return bool(await page.evaluate(js))
-    except Exception:
-        return False
-
-
 async def open_dialog(page: Page, layer: int) -> str:
     """Navigate, arm, click the action. Retries once if nothing opens."""
     url = checkout.PLANS if layer == 1 else SETTINGS
@@ -178,13 +168,12 @@ async def open_dialog(page: Page, layer: int) -> str:
         await checkout.arm(page, layer, await checkout.capture_sub_id(page))
 
         clicked = False
-        if layer == 1:
-            clicked = await click_pro_discount(page)
-        if not clicked:
-            for sel in sels:
-                if await click_visible(page, sel):
-                    clicked = True
-                    break
+        for sel in sels:
+            if await click_visible(page, sel):
+                clicked = True
+                break
+        if not clicked and layer == 1:
+            clicked = bool(await page.evaluate(PLAN_CTA_JS))
         if not clicked:
             say("DIALOG", f"tombol aksi tidak ada yang terlihat (percobaan {attempt + 1})")
             continue
@@ -312,54 +301,75 @@ async def ensure_card(page: Page, acc_id: str) -> bool:
         say("KARTU", "tombol Add card tidak ditemukan")
         return False
 
-    for _ in range(25):
-        await asyncio.sleep(1.0)
+    # Tunggu modal benar-benar selesai digambar: jumlah kolom stabil dan tombol
+    # simpan sudah ada. Mengetik di modal setengah jadi membuat angka kartu hilang.
+    frame = None
+    prev = -1
+    ready = False
+    for _ in range(40):
+        await asyncio.sleep(0.5)
         frame = None
         for f in page.frames:
             try:
-                if await f.locator("input:visible").count() >= 3:
-                    frame = f
-                    break
+                n = await f.locator("input:visible").count()
             except Exception:
                 continue
+            if n >= 3:
+                frame = f
+                break
         if frame is None:
             continue
-        say("FRAME", f"form kartu di {frame.url[:70]}")
-        inputs = frame.locator("input:visible")
-        values = [number, exp, cvc]
-        saved = False
-        for attempt in range(2):
-            if attempt:
-                say("KARTU", "form belum tuntas — isi ulang pelan")
-                await asyncio.sleep(2.0)
-                frame = None
-                for f in page.frames:
-                    try:
-                        if await f.locator("input:visible").count() >= 3:
-                            frame = f
-                            break
-                    except Exception:
-                        continue
-                if frame is None:
-                    break
-                inputs = frame.locator("input:visible")
-            await asyncio.sleep(0.4)
+        n = await frame.locator("input:visible").count()
+        if n == prev and await frame.locator('button:has-text("Save card")').count():
+            ready = True
+            break
+        prev = n
+    if not ready or frame is None:
+        say("KARTU", "form kartu tidak siap")
+        return False
+    say("FRAME", f"form kartu di {frame.url[:70]}")
+    await asyncio.sleep(1.0)
 
-            for idx, value in enumerate(values):
-                field = inputs.nth(idx)
-                await field.click()
-                await field.fill("")
-                # Nomor kartu diformat ulang oleh Google sambil diketik, jadi lebih
-                # pelan dan diberi jeda supaya field berikutnya tidak bergeser.
-                await field.press_sequentially(value, delay=70 if idx == 0 else 45)
-                await asyncio.sleep(0.9 if idx == 0 else 0.45)
-            if await inputs.count() >= 5:
+    inputs = frame.locator("input:visible")
+    values = [number, exp, cvc]
+    saved = False
+    for attempt in range(2):
+        if attempt:
+            say("KARTU", "form belum tuntas — isi ulang pelan")
+            await asyncio.sleep(2.0)
+            frame = None
+            for f in page.frames:
                 try:
-                    if not (await inputs.nth(3).input_value()).strip():
-                        await inputs.nth(3).fill("CARD HOLDER")
-                    await inputs.nth(4).fill("97201")
+                    if await f.locator("input:visible").count() >= 3:
+                        frame = f
+                        break
                 except Exception:
-                    pass
+                    continue
+            if frame is None:
+                break
+            inputs = frame.locator("input:visible")
+        await asyncio.sleep(0.4)
+
+        for idx, value in enumerate(values):
+            field = inputs.nth(idx)
+            await field.click()
+            try:
+                if (await field.input_value()).strip():
+                    await field.press("Meta+a")
+                    await field.press("Backspace")
+            except Exception:
+                pass
+            await asyncio.sleep(0.4)
+            # Diketik, bukan fill: Google memformat ulang nomor sambil diketik.
+            await field.press_sequentially(value, delay=80 if idx == 0 else 55)
+            await asyncio.sleep(1.0 if idx == 0 else 0.5)
+        if await inputs.count() >= 5:
+            try:
+                if not (await inputs.nth(3).input_value()).strip():
+                    await inputs.nth(3).press_sequentially("CARD HOLDER", delay=40)
+                await inputs.nth(4).press_sequentially("97201", delay=40)
+            except Exception:
+                pass
             await asyncio.sleep(0.8)
 
             save = 'button:has-text("Save card")'
@@ -625,11 +635,12 @@ async def detach_on_google(page: Page, last4: str) -> bool:
         await nav.goto(page, "https://play.google.com/store/paymentmethods")
         asked = saved = tried_edit = False
         absent = 0
-        # Halaman Play/payments mengikuti bahasa akun, bukan ?hl=en — akun
-        # Indonesia menampilkan label Indonesia. Semua pencocokan teks di sini
-        # dwibahasa; label tombol verifikasi pun dua varian ("Verify that
-        # it's you" di Play, "Verify it's you" di payments center).
         for _ in range(750):                      # ±300s, tanpa tunggu tetap
+            # Halaman Play/payments mengikuti bahasa akun, bukan ?hl=en —
+            # akun Indonesia menampilkan label Indonesia. Semua pencocokan
+            # teks di sini dwibahasa; label tombol verifikasi pun dua varian
+            # ("Verify that it's you" di Play, "Verify it's you" di payments
+            # center).
             if await any_text(page, "sure that it's you") or \
                     await any_text(page, "memastikan bahwa ini memang anda"):
                 # Re-auth hanya terkirim kalau tombolnya ditekan; kalau sesi sudah
